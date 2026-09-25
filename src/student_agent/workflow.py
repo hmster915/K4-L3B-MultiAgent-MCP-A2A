@@ -12,6 +12,9 @@ from .trace import TraceWriter
 class EvidenceCollector:
     """Case-scoped MCP access, caching, and evidence trace recording."""
 
+    max_attempts = 2
+    call_timeout_seconds = 30
+
     def __init__(
         self,
         *,
@@ -33,11 +36,26 @@ class EvidenceCollector:
     ) -> dict[str, Any]:
         cache_key = (tool_name, tuple(sorted(arguments.items())))
         if cache_key not in self._cache:
-            self._cache[cache_key] = await self.gateway.call(
-                tool_name,
-                case_id=self.case_id,
-                **arguments,
-            )
+            last_error: BaseException | None = None
+            for attempt in range(self.max_attempts):
+                try:
+                    self._cache[cache_key] = await asyncio.wait_for(
+                        self.gateway.call(
+                            tool_name,
+                            case_id=self.case_id,
+                            **arguments,
+                        ),
+                        timeout=self.call_timeout_seconds,
+                    )
+                    break
+                except (RuntimeError, asyncio.TimeoutError) as exc:
+                    last_error = exc
+                    if attempt + 1 == self.max_attempts:
+                        raise RuntimeError(
+                            f"MCP evidence unavailable for {tool_name}"
+                        ) from exc
+            if cache_key not in self._cache and last_error is not None:
+                raise RuntimeError(f"MCP evidence unavailable for {tool_name}") from last_error
 
         evidence = self._cache[cache_key]
         self.trace.emit(
