@@ -53,6 +53,14 @@ và chỉ gửi bundle của case hiện tại cho verifier. Verifier ưu tiên 
 nguồn mâu thuẫn, ghi conflict vào `data_conflicts`, và map từng claim sang evidence refs.
 Output tiếp tục được validate bằng public L3B schema; không sửa hoặc tự tạo evidence ref.
 
+Sau khi `gpt-4o-mini` trả JSON, `verifier.verify_and_repair()` (thuần Python, không gọi
+MCP hay LLM) đối chiếu mọi `evidence_ref` trong output — cả top-level lẫn từng
+`claim_assessments[].evidence_refs` — với tập ref thật đã thu thập trong case. Ref không
+tồn tại bị strip; claim mất hết ref hợp lệ bị hạ xuống `insufficient_evidence`; nếu toàn bộ
+`evidence_refs` rỗng mà `case_status = action_required` thì hạ xuống `needs_investigation`.
+Bước này là lưới an toàn cuối cùng chống hallucination evidence_ref từ model, độc lập với
+prompt injection.
+
 ## 5. Failure and efficiency policy
 
 | Failure | Retry budget | Fallback | Trace event/code |
@@ -80,6 +88,12 @@ Trước finalize, verifier phải bảo đảm:
 - conflict ghi rõ sources, selected source và resolution code;
 - confidence nằm trong `[0, 1]` và giảm khi evidence thiếu/mâu thuẫn;
 - output pass local JSON Schema trước khi ghi file.
+
+Các mục evidence-ref ownership, payment totals math (`refundable = max(0, captured −
+refunded)`), shipment/late-seller consistency, candidate coverage và confidence calibration
+ở trên được `verifier.verify_and_repair()` enforce bằng code xác định (deterministic),
+không chỉ dựa vào system prompt của `gpt-4o-mini`. Xem `src/student_agent/verifier.py` và
+`tests/test_verifier.py`.
 
 ## 7. Reproducibility
 

@@ -9,6 +9,7 @@ from .contracts import Contracts
 from .llm_validator import validate_with_gpt4o_mini
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
+from .verifier import verify_and_repair
 
 REQUIRED_TOOLS = {
     "get_customer_history",
@@ -213,6 +214,8 @@ async def solve_case(
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
     output = await validate_with_gpt4o_mini(case, evidence, settings, contracts)
+    output, local_repairs_applied = verify_and_repair(output, evidence, case)
+    contracts.validate_output(output, f"local-verifier/{case_id}")
     trace.emit(
         case_id=case_id,
         event_type="verification_completed",
@@ -220,6 +223,10 @@ async def solve_case(
         target="coordinator",
         decision_code="SCHEMA_AND_EVIDENCE_VALIDATED",
         evidence_refs=output["evidence_refs"],
-        attributes={"model": settings.openai_model, "mcp_calls": len(evidence)},
+        attributes={
+            "model": settings.openai_model,
+            "mcp_calls": len(evidence),
+            "local_repairs_applied": local_repairs_applied,
+        },
     )
     return output
