@@ -192,6 +192,18 @@ class FullGateway:
         }
 
 
+class CanceledPaidGateway(FullGateway):
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        evidence = await super().call(tool_name, case_id=case_id, **arguments)
+        if tool_name == "get_order":
+            evidence["data"] = {"order_id": arguments["order_id"], "order_status": "canceled"}
+        elif tool_name == "get_order_payments":
+            evidence["data"] = {"payments": [{"payment_value": 45.0}]}
+        elif tool_name == "get_refund_timeline":
+            evidence["data"] = {"refunded_total_brl": 0.0, "refundable_total_brl": 45.0}
+        return evidence
+
+
 def test_evidence_collector_caches_case_scoped_request_and_traces_each_consumer() -> None:
     async def scenario() -> tuple[FakeGateway, FakeTrace, dict[str, Any], dict[str, Any]]:
         gateway = FakeGateway()
@@ -420,3 +432,32 @@ def test_solve_case_returns_schema_valid_verified_output(tmp_path: Path) -> None
         json.loads(event)["event_type"] == "verification_completed"
         for event in trace.path.read_text(encoding="utf-8").splitlines()
     )
+
+
+def test_policy_and_verifier_handle_canceled_paid_order_consistently(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    contracts = Contracts(root / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+    case = {
+        "case_id": "CASE_002",
+        "candidate_order_ids": ["order-123"],
+        "customer_request": {"claims": []},
+        "policy_version": "EC_POLICY_V2",
+        "investigation_scope": {},
+    }
+
+    output = asyncio.run(solve_case(case, CanceledPaidGateway(), trace))
+
+    assert output["assessment"]["primary_issue"] == "canceled_order_paid"
+    assert output["root_cause_analysis"]["responsible_parties"] == [
+        {"party_type": "platform", "party_id": None}
+    ]
+    assert output["financial_resolution"] == {
+        "currency": "BRL",
+        "recommended_refund_brl": 45.0,
+        "refund_lines": [
+            {"reason_code": "CANCELED_ORDER_PAID", "amount_brl": 45.0, "entity_id": "order-123"}
+        ],
+    }
+    assert output["assessment"]["confidence"] < 1.0
+    contracts.validate_output(output, "canceled paid output")

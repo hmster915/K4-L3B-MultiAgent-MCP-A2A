@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -197,6 +198,7 @@ def create_case_context(
 async def run_order_item_agent(context: CaseContext) -> dict[str, Any]:
     evidence_refs: list[str] = []
     supported_order_ids: list[str] = []
+    order_statuses: dict[str, list[str]] = {}
 
     for order_id in context.candidate_order_ids:
         try:
@@ -211,6 +213,9 @@ async def run_order_item_agent(context: CaseContext) -> dict[str, Any]:
         evidence_refs.append(evidence["evidence_ref"])
         if _contains_identifier(evidence.get("data"), "order_id", order_id):
             supported_order_ids.append(order_id)
+            order_statuses[order_id] = _find_strings(
+                evidence.get("data"), {"order_status", "status", "order_state"}
+            )
 
     rejected_candidates = [
         order_id
@@ -273,6 +278,7 @@ async def run_order_item_agent(context: CaseContext) -> dict[str, Any]:
             "shipment_ids": [],
         },
         "evidence_refs": list(dict.fromkeys(evidence_refs)),
+        "order_statuses": order_statuses,
     }
     context.collector.trace.emit(
         case_id=context.case_id,
@@ -520,9 +526,23 @@ def _primary_issue(
     entity_resolution: dict[str, Any],
     payment_analysis: dict[str, Any],
     shipment_analysis: dict[str, Any],
+    order_statuses: dict[str, list[str]] | None = None,
 ) -> str:
     if entity_resolution.get("status") != "resolved":
         return "insufficient_evidence"
+    normalized_statuses = {
+        status.lower()
+        for statuses in (order_statuses or {}).values()
+        for status in statuses
+    }
+    if normalized_statuses.intersection({"canceled", "cancelled"}):
+        if (payment_analysis.get("captured_total_brl") or 0) > (
+            payment_analysis.get("refunded_total_brl") or 0
+        ):
+            return "canceled_order_paid"
+    if normalized_statuses.intersection({"unavailable", "out_of_stock", "unavailable_order"}):
+        if (payment_analysis.get("captured_total_brl") or 0) > 0:
+            return "unavailable_order_paid"
     payment_issue = {
         "capture_mismatch": "payment_mismatch",
         "duplicate_capture": "duplicate_charge",
@@ -552,6 +572,25 @@ def _case_status(primary_issue: str) -> str:
     return "action_required"
 
 
+def _resolution_actions(primary_issue: str) -> list[str]:
+    actions_by_issue = {
+        "canceled_order_paid": ["issue_refund", "resolve_customer_complaint"],
+        "unavailable_order_paid": ["issue_refund", "resolve_customer_complaint"],
+        "late_delivery_seller": ["escalate_to_seller", "resolve_customer_complaint"],
+        "late_delivery_logistics": [
+            "escalate_to_logistics_provider",
+            "resolve_customer_complaint",
+        ],
+        "payment_mismatch": ["reconcile_payment", "resolve_customer_complaint"],
+        "duplicate_charge": ["reverse_duplicate_charge", "resolve_customer_complaint"],
+        "refund_pending": ["issue_refund", "resolve_customer_complaint"],
+        "refund_failed": ["retry_refund", "resolve_customer_complaint"],
+        "unsupported_claim": ["no_action"],
+        "insufficient_evidence": ["investigate_insufficient_evidence"],
+    }
+    return actions_by_issue[primary_issue]
+
+
 def _root_cause(primary_issue: str, seller_ids: list[str]) -> dict[str, Any]:
     cause_codes = {
         "late_delivery_seller": "SELLER_DELAY",
@@ -560,10 +599,14 @@ def _root_cause(primary_issue: str, seller_ids: list[str]) -> dict[str, Any]:
         "duplicate_charge": "DUPLICATE_CAPTURE",
         "refund_pending": "REFUND_PENDING",
         "refund_failed": "REFUND_FAILED",
+        "canceled_order_paid": "CANCELED_ORDER_PAID",
+        "unavailable_order_paid": "UNAVAILABLE_ORDER_PAID",
         "unsupported_claim": "CLAIM_NOT_SUPPORTED",
         "insufficient_evidence": "INSUFFICIENT_EVIDENCE",
     }
-    if primary_issue == "late_delivery_seller":
+    if primary_issue in {"canceled_order_paid", "unavailable_order_paid"}:
+        responsible = [{"party_type": "platform", "party_id": None}]
+    elif primary_issue == "late_delivery_seller":
         responsible = [
             {"party_type": "seller", "party_id": seller_ids[0] if seller_ids else None}
         ]
@@ -584,12 +627,78 @@ def _root_cause(primary_issue: str, seller_ids: list[str]) -> dict[str, Any]:
     }
 
 
+def _load_scoring_policy(context: CaseContext) -> dict[str, Any]:
+    contracts = getattr(context.collector.trace, "contracts", None)
+    if contracts is None:
+        return {}
+    policy_path = contracts.root.parent / "scoring" / "scoring-policy-v2.json"
+    return json.loads(policy_path.read_text(encoding="utf-8"))
+
+
+def _calibrate_confidence(
+    *,
+    entity_confidence: float,
+    primary_issue: str,
+    payment_analysis: dict[str, Any],
+    shipment_analysis: dict[str, Any],
+    policy_evidence_refs: list[str],
+) -> float:
+    evidence_quality = 1.0
+    if payment_analysis.get("verdict") == "insufficient_evidence":
+        evidence_quality -= 0.35
+    if not shipment_analysis.get("timeline_complete", False):
+        evidence_quality -= 0.15
+    if not policy_evidence_refs:
+        evidence_quality -= 0.15
+    if shipment_analysis.get("verdict") == "conflicting":
+        evidence_quality -= 0.25
+    if primary_issue == "insufficient_evidence":
+        evidence_quality = min(evidence_quality, 0.4)
+    return round(max(0.0, min(entity_confidence, evidence_quality, 0.95)), 3)
+
+
+def _validate_cross_field_consistency(output: dict[str, Any]) -> None:
+    primary_issue = output["assessment"]["primary_issue"]
+    parties = {
+        party["party_type"]
+        for party in output["root_cause_analysis"]["responsible_parties"]
+    }
+    expected_party = {
+        "canceled_order_paid": "platform",
+        "unavailable_order_paid": "platform",
+        "late_delivery_seller": "seller",
+        "late_delivery_logistics": "logistics_provider",
+        "payment_mismatch": "payment_provider",
+        "duplicate_charge": "payment_provider",
+        "refund_pending": "payment_provider",
+        "refund_failed": "payment_provider",
+    }.get(primary_issue)
+    if expected_party is not None and expected_party not in parties:
+        raise ValueError(
+            f"inconsistent responsible party for {primary_issue}: {sorted(parties)}"
+        )
+
+    financial = output["financial_resolution"]
+    refund_lines = financial["refund_lines"]
+    refund_total = financial["recommended_refund_brl"]
+    if primary_issue in {"canceled_order_paid", "unavailable_order_paid", "refund_pending"}:
+        if refund_total <= 0 or not refund_lines:
+            raise ValueError(f"refund is missing for {primary_issue}")
+    elif refund_total != 0 or refund_lines:
+        raise ValueError(f"unexpected refund for {primary_issue}")
+
+    confidence = output["assessment"]["confidence"]
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError("assessment confidence is outside [0, 1]")
+
+
 async def run_policy_agent(
     context: CaseContext,
     order_result: dict[str, Any],
     payment_result: dict[str, Any],
     shipment_result: dict[str, Any],
 ) -> dict[str, Any]:
+    _load_scoring_policy(context)
     policy_evidence_refs: list[str] = []
     try:
         policy_evidence = await context.collector.collect(
@@ -603,20 +712,37 @@ async def run_policy_agent(
     entity_resolution = order_result["entity_resolution"]
     payment_analysis = payment_result["payment_analysis"]
     shipment_analysis = shipment_result["shipment_analysis"]
-    primary_issue = _primary_issue(entity_resolution, payment_analysis, shipment_analysis)
+    primary_issue = _primary_issue(
+        entity_resolution,
+        payment_analysis,
+        shipment_analysis,
+        order_result.get("order_statuses"),
+    )
     case_status = _case_status(primary_issue)
     refund_amount = 0.0
-    if payment_analysis.get("verdict") == "refund_pending":
+    refund_reason = None
+    if primary_issue in {"canceled_order_paid", "unavailable_order_paid"}:
+        refund_amount = max(
+            0.0,
+            (payment_analysis.get("captured_total_brl") or 0.0)
+            - (payment_analysis.get("refunded_total_brl") or 0.0),
+        )
+        refund_reason = primary_issue.upper()
+    elif payment_analysis.get("verdict") == "refund_pending":
         refund_amount = payment_analysis.get("refundable_total_brl") or 0.0
+        refund_reason = "REFUND_PENDING"
     order_id = (entity_resolution.get("resolved_order_ids") or [None])[0]
     return {
         "assessment": {
             "primary_issue": primary_issue,
             "secondary_issues": [],
             "case_status": case_status,
-            "confidence": min(
-                entity_resolution.get("confidence", 0.0),
-                0.9 if primary_issue != "insufficient_evidence" else 0.4,
+            "confidence": _calibrate_confidence(
+                entity_confidence=entity_resolution.get("confidence", 0.0),
+                primary_issue=primary_issue,
+                payment_analysis=payment_analysis,
+                shipment_analysis=shipment_analysis,
+                policy_evidence_refs=policy_evidence_refs,
             ),
         },
         "root_cause_analysis": _root_cause(
@@ -629,7 +755,7 @@ async def run_policy_agent(
             "refund_lines": (
                 [
                     {
-                        "reason_code": "REFUND_PENDING",
+                        "reason_code": refund_reason,
                         "amount_brl": refund_amount,
                         "entity_id": order_id,
                     }
@@ -638,13 +764,7 @@ async def run_policy_agent(
                 else []
             ),
         },
-        "resolution_actions": (
-            ["investigate_insufficient_evidence"]
-            if primary_issue == "insufficient_evidence"
-            else ["no_action"]
-            if primary_issue == "unsupported_claim"
-            else ["resolve_customer_complaint"]
-        ),
+        "resolution_actions": _resolution_actions(primary_issue),
         "policy_evidence_refs": policy_evidence_refs,
     }
 
@@ -701,6 +821,7 @@ async def run_verifier_agent(
         "financial_resolution": policy_result["financial_resolution"],
         "resolution_actions": policy_result["resolution_actions"],
     }
+    _validate_cross_field_consistency(output)
     contracts = getattr(context.collector.trace, "contracts", None)
     if contracts is not None:
         contracts.validate_output(output, f"outputs/{context.case_id}.json")
