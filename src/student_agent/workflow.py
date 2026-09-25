@@ -65,8 +65,20 @@ async def _consume(
     actor: str,
     tool_name: str,
     arguments: dict[str, str],
-) -> dict[str, Any]:
-    result = await gateway.call(tool_name, case_id=case_id, **arguments)
+) -> dict[str, Any] | None:
+    try:
+        result = await gateway.call(tool_name, case_id=case_id, **arguments)
+    except RuntimeError:
+        # The competition gateway reports "not applicable to this case" (e.g. no
+        # refund on record) as a tool error rather than an empty evidence object.
+        # Record the observed lookup outcome without inventing an evidence_ref,
+        # and let the caller proceed with whatever evidence it does have.
+        evidence.append({
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "observed_result": "tool_error_no_evidence",
+        })
+        return None
     evidence.append({"tool_name": tool_name, "response": result})
     trace.emit(
         case_id=case_id,
@@ -116,28 +128,16 @@ async def solve_case(
     _assign(trace, case_id, "entity-agent", "RESOLVE_ORDER_CANDIDATES")
     order_evidence: dict[str, dict[str, Any]] = {}
     for order_id in candidates:
-        try:
-            order_evidence[order_id] = await _consume(
-                gateway,
-                trace,
-                evidence,
-                case_id=case_id,
-                actor="entity-agent",
-                tool_name="get_order",
-                arguments={"order_id": order_id},
-            )
-        except RuntimeError:
-            # The competition gateway reports an unknown candidate as a tool error
-            # instead of returning a synthetic evidence object. Preserve that observed
-            # lookup outcome for entity resolution without inventing an evidence_ref.
-            order_evidence[order_id] = {"data": None}
-            evidence.append(
-                {
-                    "tool_name": "get_order",
-                    "arguments": {"order_id": order_id},
-                    "observed_result": "tool_error_no_evidence",
-                }
-            )
+        result = await _consume(
+            gateway,
+            trace,
+            evidence,
+            case_id=case_id,
+            actor="entity-agent",
+            tool_name="get_order",
+            arguments={"order_id": order_id},
+        )
+        order_evidence[order_id] = result if result is not None else {"data": None}
     selected_order_id = _select_order_id(candidates, order_evidence)
     _handoff(
         trace,
