@@ -39,6 +39,16 @@ def _structured_output_schema(schema_root: Path) -> dict[str, Any]:
             ref = value.get("$ref")
             if isinstance(ref, str) and ref.startswith("l3a-output-v2.schema.json#/"):
                 value["$ref"] = ref.removeprefix("l3a-output-v2.schema.json")
+            # OpenAI Structured Outputs (response_format=json_schema, strict=True)
+            # rejects any schema containing 'uniqueItems'. The public contract still
+            # requires uniqueness; verify_and_repair() re-checks it after the fact.
+            value.pop("uniqueItems", None)
+            # OpenAI Structured Outputs requires an explicit 'type' on every node.
+            # The public contract relies on JSON Schema's implicit typing for
+            # enum/const nodes; every enum/const value in this contract is a
+            # string, so backfill 'type': 'string' where it's missing.
+            if "type" not in value and ("enum" in value or "const" in value):
+                value["type"] = "string"
             for child in value.values():
                 rewrite(child)
         elif isinstance(value, list):
@@ -78,9 +88,9 @@ async def _completion(
     *,
     structured: bool,
 ) -> dict[str, Any]:
-    if not settings.openai_api_key:
+    if not settings.openrouter_api_key:
         raise RuntimeError(
-            "OPENAI_API_KEY is required to validate cases with gpt-4o-mini; "
+            "OPENROUTER_API_KEY is required to validate cases with gpt-4o-mini; "
             "add it to .env and rerun"
         )
     response_format: dict[str, Any]
@@ -101,7 +111,7 @@ async def _completion(
         "temperature": 0,
         "response_format": response_format,
     }
-    headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
+    headers = {"Authorization": f"Bearer {settings.openrouter_api_key}"}
     timeout = httpx2.Timeout(180.0, connect=30.0, write=30.0, pool=30.0)
     async with httpx2.AsyncClient(headers=headers, timeout=timeout) as client:
         response = await client.post(
