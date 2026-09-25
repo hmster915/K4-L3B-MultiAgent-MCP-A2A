@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,34 @@ it. Keep all cross-fields consistent: financial totals, responsible parties, cas
 shipment/payment verdicts, and actions. Use needs_investigation and calibrated confidence
 when evidence is genuinely insufficient. Cause codes must be uppercase snake case. Actions
 and secondary issues must be concise and contain no unsupported facts.
+
+The first claim in customer_request.claims is the primary complaint. When its verdict is
+supported or partially_supported by authoritative evidence, use that claim topic as
+assessment.primary_issue; place other discovered issues in secondary_issues. Do not replace
+a supported shipment complaint with a financial issue merely because a refund is due.
+
+The top-level object must contain exactly: schema_version, case_id, assessment,
+affected_entities, claim_assessments, entity_resolution, customer_context,
+shipment_analysis, payment_analysis, root_cause_analysis, evidence_refs,
+data_conflicts, financial_resolution, and resolution_actions. Do not wrap the result in
+case, evidence, result, output, assessment_result, or any other container.
 """
+
+
+UNSUPPORTED_STRICT_KEYWORDS = {
+    "$schema",
+    "$id",
+    "format",
+    "maxItems",
+    "maxLength",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minimum",
+    "pattern",
+    "title",
+    "uniqueItems",
+}
 
 
 def _structured_output_schema(schema_root: Path) -> dict[str, Any]:
@@ -50,6 +79,25 @@ def _structured_output_schema(schema_root: Path) -> dict[str, Any]:
     if "claim_assessments" not in required:
         required.append("claim_assessments")
     schema["required"] = required
+
+    def remove_unsupported(value: Any) -> None:
+        if isinstance(value, dict):
+            if "type" not in value and "const" in value:
+                value["type"] = "string" if isinstance(value["const"], str) else "number"
+            if "type" not in value and "enum" in value:
+                enum_values = value["enum"]
+                if enum_values and all(isinstance(item, str) for item in enum_values):
+                    value["type"] = "string"
+            for key in list(value):
+                if key in UNSUPPORTED_STRICT_KEYWORDS:
+                    value.pop(key)
+                else:
+                    remove_unsupported(value[key])
+        elif isinstance(value, list):
+            for child in value:
+                remove_unsupported(child)
+
+    remove_unsupported(schema)
     return schema
 
 
@@ -103,11 +151,28 @@ async def _completion(
     }
     headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
     timeout = httpx2.Timeout(180.0, connect=30.0, write=30.0, pool=30.0)
-    async with httpx2.AsyncClient(headers=headers, timeout=timeout) as client:
-        response = await client.post(
-            f"{settings.openai_base_url}/chat/completions",
-            json=payload,
-        )
+    response = None
+    last_transport_error: Exception | None = None
+    for attempt in range(6):
+        try:
+            async with httpx2.AsyncClient(headers=headers, timeout=timeout) as client:
+                response = await client.post(
+                    f"{settings.openai_base_url}/chat/completions",
+                    json=payload,
+                )
+        except httpx2.TransportError as exc:
+            last_transport_error = exc
+            if attempt == 5:
+                raise RuntimeError("OpenAI validation failed after network retries") from exc
+            await asyncio.sleep(min(15.0, 2.0 + attempt * 2.0))
+            continue
+        if response.status_code != 429:
+            break
+        match = re.search(r"try again in ([0-9.]+)s", response.text, re.IGNORECASE)
+        suggested = float(match.group(1)) if match else 2.0
+        await asyncio.sleep(min(15.0, suggested + 1.0 + attempt * 0.5))
+    if response is None:
+        raise RuntimeError("OpenAI validation did not receive a response") from last_transport_error
     if response.status_code >= 400:
         detail = response.text[:500]
         raise RuntimeError(f"OpenAI validation failed ({response.status_code}): {detail}")
@@ -153,6 +218,13 @@ async def validate_with_gpt4o_mini(
             raise
         messages[0]["content"] += (
             " The response must be valid JSON matching the supplied public contract."
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": "Required output JSON Schema:\n"
+                + json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            }
         )
         output = await _completion(settings, messages, schema, structured=False)
 

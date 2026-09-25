@@ -57,14 +57,16 @@ Output tiếp tục được validate bằng public L3B schema; không sửa ho�
 
 | Failure | Retry budget | Fallback | Trace event/code |
 | --- | ---: | --- | --- |
-| MCP timeout | 0 automatic retry | Dừng case, không tạo fallback | Runtime error; không finalize |
+| MCP timeout/tool error | 0 automatic retry | Ghi nhận thiếu evidence, không tạo ref giả | Verifier giảm confidence hoặc needs investigation |
 | Entity not found/ambiguous | 0 broad scan | Chỉ dùng candidate đã cấp; verifier trả `not_found`/`ambiguous` | `ORDER_NOT_FOUND` hoặc confidence thấp |
 | Source conflict | Không gọi lại | Ưu tiên authoritative lifecycle/policy, nếu chưa giải được thì ghi conflict | `policy_decided` và output `data_conflicts` |
 | Invalid model result | 1 repair call | Gửi lỗi schema để sửa; vẫn lỗi thì dừng | Không emit `verification_completed` |
 
-Budget thông thường là 10 MCP calls/case: hai candidate order calls và tám call chuyên
-biệt. Không gọi `get_sellers` vì seller IDs đã có trong item evidence. Không cache hoặc
-tái sử dụng evidence giữa các case.
+Budget mục tiêu là 5–7 MCP calls/case. Workflow chỉ lookup claimed order authoritative,
+loại placeholder candidate cục bộ, luôn lấy customer/product/payment/policy context, và
+chỉ lấy item/shipment hoặc refund timeline khi claim chính cần domain đó. Không gọi
+`get_sellers` hay `get_order_payments` vì dữ liệu cần thiết đã có trong item evidence và
+authoritative payment timeline. Không cache hoặc tái sử dụng evidence giữa các case.
 
 ## 6. Verification invariants
 

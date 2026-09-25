@@ -11,7 +11,7 @@ from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
 from .submission import package_submission, validate_artifacts
-from .trace import TraceWriter
+from .trace import TraceWriter, normalize_trace
 from .workflow import solve_case
 
 
@@ -27,7 +27,7 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-async def _run(root: Path) -> None:
+async def _run(root: Path, *, resume: bool = False, concurrency: int = 1) -> None:
     settings = Settings.load(root)
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY is required for the gpt-4o-mini verification step")
@@ -39,29 +39,63 @@ async def _run(root: Path) -> None:
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
+    completed: set[str] = set()
+    if resume:
+        for path in output_root.glob("*.json"):
+            if path.stem in case_set.cases:
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    contracts.validate_output(value, f"outputs/{path.name}")
+                    completed.add(path.stem)
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    path.unlink(missing_ok=True)
+        if trace_path.exists():
+            kept = []
+            for line in trace_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("case_id") in completed:
+                    kept.append(line)
+            trace_path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    else:
+        for stale in output_root.glob("*.json"):
+            stale.unlink()
+        trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        async def process_case(case_id: str) -> None:
+            async with semaphore:
+                case = case_set.cases[case_id]
+                trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                output = await solve_case(case, gateway, trace)
+                contracts.validate_output(output, f"outputs/{case_id}.json")
+                if output.get("case_id") != case_id:
+                    raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                target = output_root / f"{case_id}.json"
+                temporary = target.with_suffix(".json.tmp")
+                temporary.write_text(
+                    json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                temporary.replace(target)
+                trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+
+        pending = [case_id for case_id in case_set.case_ids if case_id not in completed]
+        await asyncio.gather(*(process_case(case_id) for case_id in pending))
+
+    final_outputs = {
+        case_id: json.loads((output_root / f"{case_id}.json").read_text(encoding="utf-8"))
+        for case_id in case_set.case_ids
+    }
+    normalize_trace(trace_path, final_outputs)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -70,7 +104,9 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument("--resume", action="store_true", help="keep valid completed outputs")
+    run.add_argument("--concurrency", type=int, default=1, help="parallel case limit")
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -89,7 +125,7 @@ def main() -> None:
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, resume=args.resume, concurrency=args.concurrency))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")
