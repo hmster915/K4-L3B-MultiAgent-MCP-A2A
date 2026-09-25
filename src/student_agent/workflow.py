@@ -91,6 +91,28 @@ def _collect_identifiers(value: Any, keys: set[str]) -> list[str]:
     return found
 
 
+def _find_numbers(value: Any, keys: set[str]) -> list[float]:
+    found: list[float] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if key in keys and isinstance(child, (int, float)) and not isinstance(child, bool):
+                    found.append(float(child))
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return found
+
+
+def _sum_numbers(value: Any, keys: set[str]) -> float | None:
+    numbers = _find_numbers(value, keys)
+    return sum(numbers) if numbers else None
+
+
 def create_case_context(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> CaseContext:
@@ -195,6 +217,116 @@ async def run_order_item_agent(context: CaseContext) -> dict[str, Any]:
         target="policy-agent",
         decision_code="order_item_investigation_completed",
         evidence_refs=result["evidence_refs"],
+    )
+    return result
+
+
+async def run_payment_agent(
+    context: CaseContext, order_ids: list[str] | tuple[str, ...]
+) -> dict[str, Any]:
+    evidence_refs: list[str] = []
+    captured_total = 0.0
+    refunded_total = 0.0
+    refundable_total = 0.0
+    captured_found = False
+    refunded_found = False
+    refundable_found = False
+
+    for order_id in order_ids:
+        payment_evidence = await context.collector.collect(
+            actor="payment-agent",
+            tool_name="get_order_payments",
+            order_id=order_id,
+        )
+        timeline_evidence = await context.collector.collect(
+            actor="payment-agent",
+            tool_name="get_payment_timeline",
+            order_id=order_id,
+        )
+        refund_evidence = await context.collector.collect(
+            actor="payment-agent",
+            tool_name="get_refund_timeline",
+            order_id=order_id,
+        )
+        evidence_refs.extend(
+            [
+                payment_evidence["evidence_ref"],
+                timeline_evidence["evidence_ref"],
+                refund_evidence["evidence_ref"],
+            ]
+        )
+
+        captured = _sum_numbers(
+            payment_evidence.get("data"),
+            {"payment_value", "captured_total_brl", "captured_amount_brl"},
+        )
+        if captured is None:
+            captured = _sum_numbers(
+                timeline_evidence.get("data"), {"captured_total_brl", "captured_amount_brl"}
+            )
+        if captured is not None:
+            captured_total += captured
+            captured_found = True
+
+        refunded = _sum_numbers(
+            refund_evidence.get("data"),
+            {"refunded_total_brl", "refunded_amount_brl", "refund_amount_brl"},
+        )
+        if refunded is not None:
+            refunded_total += refunded
+            refunded_found = True
+
+        refundable = _sum_numbers(
+            refund_evidence.get("data"), {"refundable_total_brl", "refundable_amount_brl"}
+        )
+        if refundable is not None:
+            refundable_total += refundable
+            refundable_found = True
+
+    captured_value = captured_total if captured_found else None
+    refunded_value = refunded_total if refunded_found else None
+    refundable_value = refundable_total if refundable_found else None
+
+    if not any((captured_found, refunded_found, refundable_found)):
+        verdict = "insufficient_evidence"
+    elif (
+        captured_value is not None
+        and refunded_value is not None
+        and refunded_value > captured_value
+    ):
+        verdict = "capture_mismatch"
+    elif (
+        refundable_value is not None
+        and refunded_value is not None
+        and refundable_value > refunded_value
+    ):
+        verdict = "refund_pending"
+    elif (
+        refundable_value is not None
+        and refunded_value is not None
+        and refundable_value > 0
+        and refunded_value >= refundable_value
+    ):
+        verdict = "refunded"
+    else:
+        verdict = "reconciled"
+
+    result = {
+        "payment_analysis": {
+            "verdict": verdict,
+            "captured_total_brl": captured_value,
+            "refunded_total_brl": refunded_value,
+            "refundable_total_brl": refundable_value,
+        },
+        "evidence_refs": list(dict.fromkeys(evidence_refs)),
+    }
+    context.collector.trace.emit(
+        case_id=context.case_id,
+        event_type="handoff",
+        actor="payment-agent",
+        target="policy-agent",
+        decision_code="payment_investigation_completed",
+        evidence_refs=result["evidence_refs"][:20],
     )
     return result
 

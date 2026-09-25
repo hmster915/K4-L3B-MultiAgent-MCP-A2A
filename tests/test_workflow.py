@@ -3,7 +3,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from student_agent.workflow import EvidenceCollector, create_case_context, run_order_item_agent
+from student_agent.workflow import (
+    EvidenceCollector,
+    create_case_context,
+    run_order_item_agent,
+    run_payment_agent,
+)
 
 
 class FakeGateway:
@@ -56,6 +61,30 @@ class OrderGateway:
             "result_hash": "sha256:" + "a" * 64,
             "domain": domain,
             "data": data,
+        }
+
+
+class PaymentGateway:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, str]]] = []
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        self.calls.append((tool_name, case_id, arguments))
+        data_by_tool = {
+            "get_order_payments": {"payments": [{"payment_value": 100.0}]},
+            "get_payment_timeline": {"events": []},
+            "get_refund_timeline": {
+                "refunded_total_brl": 20.0,
+                "refundable_total_brl": 80.0,
+            },
+        }
+        suffix = len(self.calls)
+        return {
+            "schema_version": "day09-mcp-evidence-v1",
+            "evidence_ref": f"ev_{suffix:020d}",
+            "result_hash": "sha256:" + "b" * 64,
+            "domain": "payment" if tool_name != "get_refund_timeline" else "refund",
+            "data": data_by_tool[tool_name],
         }
 
 
@@ -157,3 +186,30 @@ def test_order_item_agent_resolves_candidate_and_collects_related_entities() -> 
         event["event_type"] == "handoff" and event["target"] == "policy-agent"
         for event in trace.events
     )
+
+
+def test_payment_agent_reconciles_capture_and_pending_refund() -> None:
+    gateway = PaymentGateway()
+    trace = FakeTrace()
+    case = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["order-123"],
+        "customer_request": {"claims": []},
+        "policy_version": "EC_POLICY_V2",
+        "investigation_scope": {},
+    }
+    context = create_case_context(case, gateway, trace)
+
+    result = asyncio.run(run_payment_agent(context, ["order-123"]))
+
+    assert result["payment_analysis"] == {
+        "verdict": "refund_pending",
+        "captured_total_brl": 100.0,
+        "refunded_total_brl": 20.0,
+        "refundable_total_brl": 80.0,
+    }
+    assert [call[0] for call in gateway.calls] == [
+        "get_order_payments",
+        "get_payment_timeline",
+        "get_refund_timeline",
+    ]
