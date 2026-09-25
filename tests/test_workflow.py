@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any
 
+from student_agent.contracts import Contracts
+from student_agent.trace import TraceWriter
 from student_agent.workflow import (
     EvidenceCollector,
     create_case_context,
@@ -10,6 +14,7 @@ from student_agent.workflow import (
     run_payment_agent,
     run_shipment_agent,
     run_specialists,
+    solve_case,
 )
 
 
@@ -111,6 +116,13 @@ class ShipmentGateway:
         }
 
 
+class FailingShipmentGateway(ShipmentGateway):
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        if arguments["order_id"] == "candidate-001":
+            raise RuntimeError("unknown candidate")
+        return await super().call(tool_name, case_id=case_id, **arguments)
+
+
 class ParallelGateway(FakeGateway):
     def __init__(self) -> None:
         super().__init__()
@@ -125,6 +137,59 @@ class ParallelGateway(FakeGateway):
             return await super().call(tool_name, case_id=case_id, **arguments)
         finally:
             self.active_calls -= 1
+
+
+class FullGateway:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, str]]] = []
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        self.calls.append((tool_name, case_id, arguments))
+        data_by_tool = {
+            "get_order": {"order_id": "order-123"},
+            "get_order_items": {
+                "items": [{"order_item_id": "item-1", "seller_id": "seller-1"}]
+            },
+            "get_product_context": {"products": [{"product_id": "product-1"}]},
+            "get_sellers": {"sellers": [{"seller_id": "seller-1"}]},
+            "get_order_payments": {"payments": [{"payment_value": 100.0}]},
+            "get_payment_timeline": {"events": []},
+            "get_refund_timeline": {
+                "refunded_total_brl": 0.0,
+                "refundable_total_brl": 0.0,
+            },
+            "get_shipment_summary": {
+                "shipping_limit_date": "2018-01-02T09:00:00-03:00",
+                "order_delivered_carrier_date": "2018-01-02T08:00:00-03:00",
+                "order_estimated_delivery_date": "2018-01-05T09:00:00-03:00",
+                "order_delivered_customer_date": "2018-01-04T09:00:00-03:00",
+            },
+            "get_policy": {"policy_version": "EC_POLICY_V2"},
+            "get_customer_history": {
+                "customer_unique_id": "customer-123",
+                "orders": [{"order_id": "order-123"}],
+            },
+        }
+        domains = {
+            "get_order": "order",
+            "get_order_items": "item",
+            "get_product_context": "product",
+            "get_sellers": "seller",
+            "get_order_payments": "payment",
+            "get_payment_timeline": "payment",
+            "get_refund_timeline": "refund",
+            "get_shipment_summary": "shipment",
+            "get_policy": "policy",
+            "get_customer_history": "customer",
+        }
+        suffix = len(self.calls)
+        return {
+            "schema_version": "day09-mcp-evidence-v1",
+            "evidence_ref": f"ev_{suffix:020d}",
+            "result_hash": "sha256:" + "d" * 64,
+            "domain": domains[tool_name],
+            "data": data_by_tool[tool_name],
+        }
 
 
 def test_evidence_collector_caches_case_scoped_request_and_traces_each_consumer() -> None:
@@ -278,6 +343,24 @@ def test_shipment_agent_identifies_seller_delay_from_timeline() -> None:
     ]
 
 
+def test_shipment_agent_preserves_valid_evidence_when_candidate_call_fails() -> None:
+    gateway = FailingShipmentGateway()
+    trace = FakeTrace()
+    case = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["candidate-001", "order-123"],
+        "customer_request": {"claims": []},
+        "policy_version": "EC_POLICY_V2",
+        "investigation_scope": {},
+    }
+    context = create_case_context(case, gateway, trace)
+
+    result = asyncio.run(run_shipment_agent(context, ["candidate-001", "order-123"]))
+
+    assert result["shipment_analysis"]["verdict"] == "seller_delay"
+    assert result["shipment_analysis"]["timeline_complete"] is False
+
+
 def test_specialists_run_concurrently_and_return_three_results() -> None:
     gateway = ParallelGateway()
     trace = FakeTrace()
@@ -297,3 +380,43 @@ def test_specialists_run_concurrently_and_return_three_results() -> None:
         next(iter(result)) for result in results
     }
     assert gateway.max_active_calls >= 2
+
+
+def test_solve_case_returns_schema_valid_verified_output(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    contracts = Contracts(root / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+    gateway = FullGateway()
+    case = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["order-123"],
+        "customer_request": {"claims": []},
+        "policy_version": "EC_POLICY_V2",
+        "investigation_scope": {"include_customer_history": True},
+        "customer_unique_id_hint": "customer-123",
+    }
+
+    output = asyncio.run(solve_case(case, gateway, trace))
+
+    contracts.validate_output(output, "test output")
+    assert output["case_id"] == "CASE_001"
+    assert set(output) <= {
+        "schema_version",
+        "case_id",
+        "assessment",
+        "affected_entities",
+        "claim_assessments",
+        "entity_resolution",
+        "customer_context",
+        "shipment_analysis",
+        "payment_analysis",
+        "root_cause_analysis",
+        "evidence_refs",
+        "data_conflicts",
+        "financial_resolution",
+        "resolution_actions",
+    }
+    assert any(
+        json.loads(event)["event_type"] == "verification_completed"
+        for event in trace.path.read_text(encoding="utf-8").splitlines()
+    )

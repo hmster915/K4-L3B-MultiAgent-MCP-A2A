@@ -50,6 +50,16 @@ class EvidenceCollector:
         return evidence
 
 
+def _record_tool_unavailable(context: CaseContext, actor: str, tool_name: str) -> None:
+    context.collector.trace.emit(
+        case_id=context.case_id,
+        event_type="handoff",
+        actor=actor,
+        target="policy-agent",
+        decision_code=f"{tool_name}_unavailable",
+    )
+
+
 @dataclass(frozen=True)
 class CaseContext:
     case_id: str
@@ -171,11 +181,15 @@ async def run_order_item_agent(context: CaseContext) -> dict[str, Any]:
     supported_order_ids: list[str] = []
 
     for order_id in context.candidate_order_ids:
-        evidence = await context.collector.collect(
-            actor="order-item-agent",
-            tool_name="get_order",
-            order_id=order_id,
-        )
+        try:
+            evidence = await context.collector.collect(
+                actor="order-item-agent",
+                tool_name="get_order",
+                order_id=order_id,
+            )
+        except RuntimeError:
+            _record_tool_unavailable(context, "order-item-agent", "get_order")
+            continue
         evidence_refs.append(evidence["evidence_ref"])
         if _contains_identifier(evidence.get("data"), "order_id", order_id):
             supported_order_ids.append(order_id)
@@ -191,11 +205,15 @@ async def run_order_item_agent(context: CaseContext) -> dict[str, Any]:
     if len(supported_order_ids) == 1:
         order_id = supported_order_ids[0]
         for tool_name in ("get_order_items", "get_product_context", "get_sellers"):
-            evidence = await context.collector.collect(
-                actor="order-item-agent",
-                tool_name=tool_name,
-                order_id=order_id,
-            )
+            try:
+                evidence = await context.collector.collect(
+                    actor="order-item-agent",
+                    tool_name=tool_name,
+                    order_id=order_id,
+                )
+            except RuntimeError:
+                _record_tool_unavailable(context, "order-item-agent", tool_name)
+                continue
             evidence_refs.append(evidence["evidence_ref"])
             if tool_name == "get_order_items":
                 item_ids.extend(
@@ -253,6 +271,7 @@ async def run_payment_agent(
     context: CaseContext, order_ids: list[str] | tuple[str, ...]
 ) -> dict[str, Any]:
     evidence_refs: list[str] = []
+    payment_references: list[str] = []
     captured_total = 0.0
     refunded_total = 0.0
     refundable_total = 0.0
@@ -261,21 +280,25 @@ async def run_payment_agent(
     refundable_found = False
 
     for order_id in order_ids:
-        payment_evidence = await context.collector.collect(
-            actor="payment-agent",
-            tool_name="get_order_payments",
-            order_id=order_id,
-        )
-        timeline_evidence = await context.collector.collect(
-            actor="payment-agent",
-            tool_name="get_payment_timeline",
-            order_id=order_id,
-        )
-        refund_evidence = await context.collector.collect(
-            actor="payment-agent",
-            tool_name="get_refund_timeline",
-            order_id=order_id,
-        )
+        try:
+            payment_evidence = await context.collector.collect(
+                actor="payment-agent",
+                tool_name="get_order_payments",
+                order_id=order_id,
+            )
+            timeline_evidence = await context.collector.collect(
+                actor="payment-agent",
+                tool_name="get_payment_timeline",
+                order_id=order_id,
+            )
+            refund_evidence = await context.collector.collect(
+                actor="payment-agent",
+                tool_name="get_refund_timeline",
+                order_id=order_id,
+            )
+        except RuntimeError:
+            _record_tool_unavailable(context, "payment-agent", "payment_evidence")
+            continue
         evidence_refs.extend(
             [
                 payment_evidence["evidence_ref"],
@@ -295,6 +318,12 @@ async def run_payment_agent(
         if captured is not None:
             captured_total += captured
             captured_found = True
+        payment_references.extend(
+            _collect_identifiers(
+                payment_evidence.get("data"),
+                {"payment_id", "payment_reference", "payment_reference_id"},
+            )
+        )
 
         refunded = _sum_numbers(
             refund_evidence.get("data"),
@@ -346,6 +375,7 @@ async def run_payment_agent(
             "refunded_total_brl": refunded_value,
             "refundable_total_brl": refundable_value,
         },
+        "payment_references": list(dict.fromkeys(payment_references)),
         "evidence_refs": list(dict.fromkeys(evidence_refs)),
     }
     context.collector.trace.emit(
@@ -368,11 +398,16 @@ async def run_shipment_agent(
     timeline_complete = bool(order_ids)
 
     for order_id in order_ids:
-        evidence = await context.collector.collect(
-            actor="shipment-agent",
-            tool_name="get_shipment_summary",
-            order_id=order_id,
-        )
+        try:
+            evidence = await context.collector.collect(
+                actor="shipment-agent",
+                tool_name="get_shipment_summary",
+                order_id=order_id,
+            )
+        except RuntimeError:
+            timeline_complete = False
+            _record_tool_unavailable(context, "shipment-agent", "get_shipment_summary")
+            continue
         evidence_refs.append(evidence["evidence_ref"])
         data = evidence.get("data")
         statuses = {
@@ -459,6 +494,208 @@ async def run_specialists(
     )
 
 
+def _unique_strings(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _primary_issue(
+    entity_resolution: dict[str, Any],
+    payment_analysis: dict[str, Any],
+    shipment_analysis: dict[str, Any],
+) -> str:
+    if entity_resolution.get("status") != "resolved":
+        return "insufficient_evidence"
+    payment_issue = {
+        "capture_mismatch": "payment_mismatch",
+        "duplicate_capture": "duplicate_charge",
+        "refund_pending": "refund_pending",
+        "refund_failed": "refund_failed",
+    }.get(payment_analysis.get("verdict"))
+    if payment_issue:
+        return payment_issue
+    shipment_issue = {
+        "seller_delay": "late_delivery_seller",
+        "logistics_delay": "late_delivery_logistics",
+    }.get(shipment_analysis.get("verdict"))
+    if shipment_issue:
+        return shipment_issue
+    if shipment_analysis.get("verdict") in {"lost", "returned", "conflicting"}:
+        return "insufficient_evidence"
+    if payment_analysis.get("verdict") == "insufficient_evidence":
+        return "insufficient_evidence"
+    return "unsupported_claim"
+
+
+def _case_status(primary_issue: str) -> str:
+    if primary_issue == "insufficient_evidence":
+        return "needs_investigation"
+    if primary_issue == "unsupported_claim":
+        return "no_action"
+    return "action_required"
+
+
+def _root_cause(primary_issue: str, seller_ids: list[str]) -> dict[str, Any]:
+    cause_codes = {
+        "late_delivery_seller": "SELLER_DELAY",
+        "late_delivery_logistics": "LOGISTICS_DELAY",
+        "payment_mismatch": "PAYMENT_MISMATCH",
+        "duplicate_charge": "DUPLICATE_CAPTURE",
+        "refund_pending": "REFUND_PENDING",
+        "refund_failed": "REFUND_FAILED",
+        "unsupported_claim": "CLAIM_NOT_SUPPORTED",
+        "insufficient_evidence": "INSUFFICIENT_EVIDENCE",
+    }
+    if primary_issue == "late_delivery_seller":
+        responsible = [
+            {"party_type": "seller", "party_id": seller_ids[0] if seller_ids else None}
+        ]
+    elif primary_issue == "late_delivery_logistics":
+        responsible = [{"party_type": "logistics_provider", "party_id": None}]
+    elif primary_issue in {
+        "payment_mismatch",
+        "duplicate_charge",
+        "refund_pending",
+        "refund_failed",
+    }:
+        responsible = [{"party_type": "payment_provider", "party_id": None}]
+    else:
+        responsible = [{"party_type": "unknown", "party_id": None}]
+    return {
+        "ranked_causes": [{"cause_code": cause_codes[primary_issue], "rank": 1}],
+        "responsible_parties": responsible,
+    }
+
+
+async def run_policy_agent(
+    context: CaseContext,
+    order_result: dict[str, Any],
+    payment_result: dict[str, Any],
+    shipment_result: dict[str, Any],
+) -> dict[str, Any]:
+    policy_evidence_refs: list[str] = []
+    try:
+        policy_evidence = await context.collector.collect(
+            actor="policy-agent",
+            tool_name="get_policy",
+            policy_version=context.policy_version,
+        )
+        policy_evidence_refs.append(policy_evidence["evidence_ref"])
+    except RuntimeError:
+        _record_tool_unavailable(context, "policy-agent", "get_policy")
+    entity_resolution = order_result["entity_resolution"]
+    payment_analysis = payment_result["payment_analysis"]
+    shipment_analysis = shipment_result["shipment_analysis"]
+    primary_issue = _primary_issue(entity_resolution, payment_analysis, shipment_analysis)
+    case_status = _case_status(primary_issue)
+    refund_amount = 0.0
+    if payment_analysis.get("verdict") == "refund_pending":
+        refund_amount = payment_analysis.get("refundable_total_brl") or 0.0
+    order_id = (entity_resolution.get("resolved_order_ids") or [None])[0]
+    return {
+        "assessment": {
+            "primary_issue": primary_issue,
+            "secondary_issues": [],
+            "case_status": case_status,
+            "confidence": min(
+                entity_resolution.get("confidence", 0.0),
+                0.9 if primary_issue != "insufficient_evidence" else 0.4,
+            ),
+        },
+        "root_cause_analysis": _root_cause(
+            primary_issue, shipment_analysis.get("late_seller_ids", [])
+        ),
+        "data_conflicts": [],
+        "financial_resolution": {
+            "currency": "BRL",
+            "recommended_refund_brl": refund_amount,
+            "refund_lines": (
+                [
+                    {
+                        "reason_code": "REFUND_PENDING",
+                        "amount_brl": refund_amount,
+                        "entity_id": order_id,
+                    }
+                ]
+                if refund_amount > 0
+                else []
+            ),
+        },
+        "resolution_actions": (
+            ["investigate_insufficient_evidence"]
+            if primary_issue == "insufficient_evidence"
+            else ["no_action"]
+            if primary_issue == "unsupported_claim"
+            else ["resolve_customer_complaint"]
+        ),
+        "policy_evidence_refs": policy_evidence_refs,
+    }
+
+
+async def run_verifier_agent(
+    context: CaseContext,
+    order_result: dict[str, Any],
+    payment_result: dict[str, Any],
+    shipment_result: dict[str, Any],
+    policy_result: dict[str, Any],
+) -> dict[str, Any]:
+    evidence_refs = _unique_strings(
+        order_result.get("evidence_refs", [])
+        + payment_result.get("evidence_refs", [])
+        + shipment_result.get("evidence_refs", [])
+        + policy_result.get("policy_evidence_refs", [])
+    )
+    customer_unique_id = None
+    related_order_ids: list[str] = []
+    if context.customer_unique_id_hint:
+        try:
+            customer_evidence = await context.collector.collect(
+                actor="verifier-agent",
+                tool_name="get_customer_history",
+                customer_unique_id=context.customer_unique_id_hint,
+            )
+            evidence_refs.append(customer_evidence["evidence_ref"])
+            customer_data = customer_evidence.get("data")
+            customer_ids = _collect_identifiers(customer_data, {"customer_unique_id"})
+            customer_unique_id = customer_ids[0] if customer_ids else None
+            related_order_ids = _collect_identifiers(customer_data, {"order_id", "order_ids"})
+        except RuntimeError:
+            _record_tool_unavailable(context, "verifier-agent", "get_customer_history")
+
+    affected_entities = dict(order_result["affected_entities"])
+    affected_entities["payment_references"] = _unique_strings(
+        payment_result.get("payment_references", [])
+    )
+    output = {
+        "schema_version": "day09-l3b-output-v2",
+        "case_id": context.case_id,
+        "assessment": policy_result["assessment"],
+        "affected_entities": affected_entities,
+        "entity_resolution": order_result["entity_resolution"],
+        "customer_context": {
+            "customer_unique_id": customer_unique_id,
+            "related_order_ids": _unique_strings(related_order_ids),
+        },
+        "shipment_analysis": shipment_result["shipment_analysis"],
+        "payment_analysis": payment_result["payment_analysis"],
+        "root_cause_analysis": policy_result["root_cause_analysis"],
+        "evidence_refs": _unique_strings(evidence_refs)[:30],
+        "data_conflicts": policy_result["data_conflicts"],
+        "financial_resolution": policy_result["financial_resolution"],
+        "resolution_actions": policy_result["resolution_actions"],
+    }
+    contracts = getattr(context.collector.trace, "contracts", None)
+    if contracts is not None:
+        contracts.validate_output(output, f"outputs/{context.case_id}.json")
+    context.collector.trace.emit(
+        case_id=context.case_id,
+        event_type="verification_completed",
+        actor="verifier-agent",
+        decision_code="output_schema_and_consistency_validated",
+        evidence_refs=output["evidence_refs"][:20],
+    )
+    return output
+
+
 async def solve_case(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
@@ -467,5 +704,25 @@ async def solve_case(
     Include entity resolution, conflict handling and evidence-efficient investigation.
     The starter kit intentionally does not generate invented fallback answers.
     """
-    del case, gateway, trace
-    raise NotImplementedError("Implement the L3B multi-agent workflow in solve_case()")
+    context = create_case_context(case, gateway, trace)
+    order_result, payment_result, shipment_result = await run_specialists(context)
+    policy_result = await run_policy_agent(
+        context,
+        order_result,
+        payment_result,
+        shipment_result,
+    )
+    trace.emit(
+        case_id=context.case_id,
+        event_type="policy_decided",
+        actor="policy-agent",
+        decision_code=policy_result["assessment"]["primary_issue"],
+        evidence_refs=policy_result["policy_evidence_refs"],
+    )
+    return await run_verifier_agent(
+        context,
+        order_result,
+        payment_result,
+        shipment_result,
+        policy_result,
+    )
