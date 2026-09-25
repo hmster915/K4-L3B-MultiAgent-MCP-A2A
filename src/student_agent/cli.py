@@ -29,10 +29,13 @@ async def _show_tools(root: Path) -> None:
 
 async def _run(root: Path) -> None:
     settings = Settings.load(root)
-    if not settings.openai_api_key:
-        raise ValueError("OPENAI_API_KEY is required for the gpt-4o-mini verification step")
-    if settings.openai_model != "gpt-4o-mini":
-        raise ValueError("OPENAI_MODEL must be gpt-4o-mini for this workflow")
+    if not settings.openrouter_api_key:
+        raise ValueError("OPENROUTER_API_KEY is required for the gpt-4o-mini verification step")
+    if not settings.openai_model.endswith("gpt-4o-mini"):
+        raise ValueError(
+            "OPENAI_MODEL must be gpt-4o-mini (or a provider-prefixed slug such as "
+            "openai/gpt-4o-mini) for this workflow"
+        )
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
     output_root = root / "outputs"

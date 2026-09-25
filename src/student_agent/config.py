@@ -15,7 +15,7 @@ class Settings:
     competition_api_url: str
     team_api_key: str
     mcp_endpoint: str
-    openai_api_key: str
+    openrouter_api_key: str
     openai_model: str
     openai_base_url: str
     root: Path
@@ -27,7 +27,7 @@ class Settings:
         api_url = os.getenv("COMPETITION_API_URL", "").strip().rstrip("/")
         team_key = os.getenv("COMPETITION_TEAM_API_KEY", "").strip()
         mcp_endpoint = os.getenv("MCP_ENDPOINT", "").strip()
-        openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
         openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
         openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
         errors: list[str] = []
@@ -45,7 +45,7 @@ class Settings:
             api_url,
             team_key,
             mcp_endpoint,
-            openai_api_key,
+            openrouter_api_key,
             openai_model or "gpt-4o-mini",
             openai_base_url.rstrip("/"),
             resolved_root,
