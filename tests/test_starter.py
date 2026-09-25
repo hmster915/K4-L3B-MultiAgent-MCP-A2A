@@ -8,7 +8,7 @@ import pytest
 from student_agent import OUTPUT_SCHEMA_VERSION, VARIANT_ID
 from student_agent.cases import CaseSet, load_case_set
 from student_agent.contracts import Contracts
-from student_agent.submission import build_manifest
+from student_agent.submission import _compact_trace_events, build_manifest
 
 
 def write_json(path: Path, value: object) -> None:
@@ -45,3 +45,32 @@ def test_generated_manifest_matches_public_contract() -> None:
     manifest = build_manifest(case_set)
     contracts.validate_manifest(manifest)
     assert manifest["output_schema_version"] == OUTPUT_SCHEMA_VERSION
+
+
+def test_trace_compactor_keeps_latest_complete_lifecycle_per_case() -> None:
+    required = [
+        "case_received",
+        "task_assigned",
+        "handoff",
+        "verification_completed",
+        "case_finalized",
+    ]
+    events = []
+    for run in ("old", "latest"):
+        for index, event_type in enumerate(required):
+            events.append(
+                {
+                    "event_id": f"evt_{run}_{index:012d}",
+                    "case_id": "CASE_001",
+                    "event_type": event_type,
+                    "occurred_at": f"2026-01-01T00:00:0{index}Z",
+                    "actor": "coordinator",
+                }
+            )
+
+    compacted = _compact_trace_events(events, {"CASE_001"})
+
+    assert len(compacted) == len(required)
+    assert {event["event_id"] for event in compacted} == {
+        f"evt_latest_{index:012d}" for index in range(len(required))
+    }

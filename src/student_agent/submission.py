@@ -39,6 +39,50 @@ def build_manifest(case_set: CaseSet) -> dict[str, Any]:
     }
 
 
+def _compact_trace_events(
+    events: list[dict[str, Any]], expected_case_ids: set[str]
+) -> list[dict[str, Any]]:
+    required = {
+        "case_received",
+        "task_assigned",
+        "handoff",
+        "verification_completed",
+        "case_finalized",
+    }
+    selected_indexes: set[int] = set()
+    for case_id in expected_case_ids:
+        case_events = [
+            (index, event)
+            for index, event in enumerate(events)
+            if event["case_id"] == case_id
+        ]
+        candidates: list[tuple[int, int]] = []
+        received_indexes = [
+            index for index, event in case_events if event["event_type"] == "case_received"
+        ]
+        finalized_indexes = [
+            index for index, event in case_events if event["event_type"] == "case_finalized"
+        ]
+        for start in received_indexes:
+            for end in finalized_indexes:
+                if end <= start:
+                    continue
+                event_types = {
+                    event["event_type"]
+                    for index, event in case_events
+                    if start <= index <= end
+                }
+                if required.issubset(event_types):
+                    candidates.append((end, start))
+        if not candidates:
+            raise ValueError(f"trace has no complete lifecycle for {case_id}")
+        end, start = max(candidates)
+        selected_indexes.update(
+            index for index, event in case_events if start <= index <= end
+        )
+    return [events[index] for index in sorted(selected_indexes)]
+
+
 def validate_artifacts(
     root: Path, case_set: CaseSet, contracts: Contracts
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
@@ -63,7 +107,7 @@ def validate_artifacts(
         trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
-    normalized_lines: list[str] = []
+    parsed_events: list[dict[str, Any]] = []
     seen_events: set[str] = set()
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
@@ -78,7 +122,13 @@ def validate_artifacts(
         if event["event_id"] in seen_events:
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
-        normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+        parsed_events.append(event)
+
+    compacted_events = _compact_trace_events(parsed_events, expected)
+    normalized_lines = [
+        json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        for event in compacted_events
+    ]
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
