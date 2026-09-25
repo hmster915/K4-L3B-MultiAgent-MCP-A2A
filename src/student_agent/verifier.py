@@ -42,6 +42,9 @@ def verify_and_repair(
         if not ca["evidence_refs"] and ca["verdict"] != "insufficient_evidence":
             ca["verdict"] = "insufficient_evidence"
             repairs += 1
+            if ca["confidence"] > 0.3:
+                ca["confidence"] = 0.3
+                repairs += 1
 
     if not out["evidence_refs"] and out["assessment"]["case_status"] == "action_required":
         out["assessment"]["case_status"] = "needs_investigation"
@@ -67,15 +70,21 @@ def verify_and_repair(
         if out["financial_resolution"]["recommended_refund_brl"] != 0.0:
             out["financial_resolution"]["recommended_refund_brl"] = 0.0
             repairs += 1
+        if out["financial_resolution"]["refund_lines"]:
+            out["financial_resolution"]["refund_lines"] = []
+            repairs += 1
 
     er = out["entity_resolution"]
     resolved = set(er["resolved_order_ids"])
     rejected = set(er["rejected_candidates"])
     for candidate in case.get("candidate_order_ids", []):
-        if candidate not in resolved and candidate not in rejected:
-            er["rejected_candidates"].append(candidate)
-            rejected.add(candidate)
-            repairs += 1
+        if candidate in resolved or candidate in rejected:
+            continue
+        if len(er["rejected_candidates"]) >= 20:  # idSet schema cap
+            break
+        er["rejected_candidates"].append(candidate)
+        rejected.add(candidate)
+        repairs += 1
 
     assessment = out["assessment"]
     cap: float | None = None

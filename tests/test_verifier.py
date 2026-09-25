@@ -107,6 +107,32 @@ def test_claim_keeps_verdict_when_a_real_ref_survives() -> None:
     assert ca["verdict"] == "supported"
 
 
+def test_claim_confidence_clamped_when_downgraded_to_insufficient_evidence() -> None:
+    output = _base_output()
+    # Top-level evidence_refs keeps a real ref, so the top-level empty-refs
+    # clamp does NOT fire — this claim's own confidence must be clamped
+    # independently.
+    output["claim_assessments"] = [
+        {"claim_id": "c1", "verdict": "supported", "confidence": 0.9,
+         "evidence_refs": [FAKE_REF]},
+    ]
+    fixed, repairs = verify_and_repair(output, _evidence(), _case())
+    ca = fixed["claim_assessments"][0]
+    assert ca["verdict"] == "insufficient_evidence"
+    assert ca["confidence"] <= 0.3
+    assert repairs >= 1
+
+
+def test_claim_confidence_left_alone_when_verdict_not_downgraded() -> None:
+    output = _base_output()
+    output["claim_assessments"] = [
+        {"claim_id": "c1", "verdict": "supported", "confidence": 0.9,
+         "evidence_refs": [REAL_REF]},
+    ]
+    fixed, _ = verify_and_repair(output, _evidence(), _case())
+    assert fixed["claim_assessments"][0]["confidence"] == 0.9
+
+
 def test_action_required_downgraded_when_all_evidence_refs_are_fake() -> None:
     output = _base_output()
     output["evidence_refs"] = [FAKE_REF]
@@ -183,6 +209,18 @@ def test_no_action_clears_resolution_actions_and_recommended_refund() -> None:
     assert repairs >= 1
 
 
+def test_no_action_clears_populated_refund_lines() -> None:
+    output = _base_output()
+    output["assessment"]["case_status"] = "no_action"
+    output["financial_resolution"]["recommended_refund_brl"] = 50.0
+    output["financial_resolution"]["refund_lines"] = [
+        {"reason_code": "DUPLICATE_CHARGE", "amount_brl": 50.0, "entity_id": "order-1"},
+    ]
+    fixed, repairs = verify_and_repair(output, _evidence(), _case())
+    assert fixed["financial_resolution"]["refund_lines"] == []
+    assert repairs >= 1
+
+
 def test_action_required_keeps_resolution_actions() -> None:
     output = _base_output()
     output["assessment"]["case_status"] = "action_required"
@@ -205,7 +243,19 @@ def test_candidate_already_covered_is_left_alone() -> None:
     case = _case()  # candidate_order_ids == ["order-1"], already in resolved_order_ids
     fixed, repairs = verify_and_repair(output, _evidence(), case)
     assert fixed["entity_resolution"]["rejected_candidates"] == []
-    assert repairs == 0
+
+
+def test_rejected_candidates_never_exceeds_schema_max_items() -> None:
+    # idSet (rejected_candidates) has maxItems: 20 in l3a-output-v2.schema.json.
+    # 25 uncovered candidates must not push the repaired list past that cap,
+    # or the follow-up contracts.validate_output() call would raise and crash
+    # the whole batch run instead of just this case.
+    output = _base_output()
+    case = _case()
+    case["candidate_order_ids"] = ["order-1", *[f"candidate-{i}" for i in range(25)]]
+    fixed, repairs = verify_and_repair(output, _evidence(), case)
+    assert len(fixed["entity_resolution"]["rejected_candidates"]) <= 20
+    assert repairs >= 1
 
 
 def test_confidence_clamped_when_entity_not_found() -> None:
