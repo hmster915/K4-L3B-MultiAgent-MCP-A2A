@@ -12,6 +12,13 @@ from mcp.client.streamable_http import streamable_http_client
 from .contracts import Contracts
 
 
+def _result_is_error(result: Any) -> bool:
+    modern_value = getattr(result, "is_error", None)
+    if modern_value is not None:
+        return bool(modern_value)
+    return bool(getattr(result, "isError", False))
+
+
 class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
@@ -24,7 +31,7 @@ class EvidenceGateway:
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if _result_is_error(result):
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
