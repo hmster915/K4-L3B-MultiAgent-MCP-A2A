@@ -29,6 +29,10 @@ async def _show_tools(root: Path) -> None:
 
 async def _run(root: Path) -> None:
     settings = Settings.load(root)
+    if not settings.openai_api_key:
+        raise ValueError("OPENAI_API_KEY is required for the gpt-4o-mini verification step")
+    if settings.openai_model != "gpt-4o-mini":
+        raise ValueError("OPENAI_MODEL must be gpt-4o-mini for this workflow")
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
     output_root = root / "outputs"
@@ -80,8 +84,7 @@ def main() -> None:
         if args.command == "validate-inputs":
             case_set = load_case_set(root)
             print(
-                f"OK: {case_set.variant_id} / {case_set.version} / "
-                f"{len(case_set.case_ids)} cases"
+                f"OK: {case_set.variant_id} / {case_set.version} / {len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))

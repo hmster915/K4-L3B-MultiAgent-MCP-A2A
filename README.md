@@ -45,7 +45,13 @@ day09 --help
 COMPETITION_API_URL=http://127.0.0.1:8081
 COMPETITION_TEAM_API_KEY=sk-team-your_key
 MCP_ENDPOINT=http://127.0.0.1:8001/mcp
+OPENAI_API_KEY=sk-your_openai_key
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_BASE_URL=https://api.openai.com/v1
 ```
+
+`OPENAI_API_KEY` được dùng riêng cho bước verifier/finalizer. Workflow này cố định model
+`gpt-4o-mini`; `.env` đã được Git ignore và không được đưa key vào trace hoặc submission.
 
 ## 3. Tải input
 
@@ -137,6 +143,10 @@ Có thể tổ chức các vai trò:
 - payment/refund agent;
 - policy hoặc conflict agent;
 - verifier.
+
+Implementation hiện tại dùng entity, customer, fulfillment, finance và policy agent. Sau
+các handoff, `gpt-4o-mini` thực hiện independent verification, tạo structured JSON và kết
+quả được validate lại bằng public JSON Schema trước khi ghi vào `outputs/`.
 
 Competition không chấm tên framework hay số lượng class. Scorer đánh giá output, evidence, efficiency và sự phối hợp thể hiện trong trace.
 
