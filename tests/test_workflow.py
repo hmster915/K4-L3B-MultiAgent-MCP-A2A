@@ -8,6 +8,7 @@ from student_agent.workflow import (
     create_case_context,
     run_order_item_agent,
     run_payment_agent,
+    run_shipment_agent,
 )
 
 
@@ -85,6 +86,27 @@ class PaymentGateway:
             "result_hash": "sha256:" + "b" * 64,
             "domain": "payment" if tool_name != "get_refund_timeline" else "refund",
             "data": data_by_tool[tool_name],
+        }
+
+
+class ShipmentGateway:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, str]]] = []
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        self.calls.append((tool_name, case_id, arguments))
+        return {
+            "schema_version": "day09-mcp-evidence-v1",
+            "evidence_ref": "ev_abcdefghijklmnopqrst",
+            "result_hash": "sha256:" + "c" * 64,
+            "domain": "shipment",
+            "data": {
+                "seller_id": "seller-1",
+                "shipping_limit_date": "2018-01-02T09:00:00-03:00",
+                "order_delivered_carrier_date": "2018-01-04T09:00:00-03:00",
+                "order_estimated_delivery_date": "2018-01-05T09:00:00-03:00",
+                "order_delivered_customer_date": "2018-01-10T09:00:00-03:00",
+            },
         }
 
 
@@ -212,4 +234,28 @@ def test_payment_agent_reconciles_capture_and_pending_refund() -> None:
         "get_order_payments",
         "get_payment_timeline",
         "get_refund_timeline",
+    ]
+
+
+def test_shipment_agent_identifies_seller_delay_from_timeline() -> None:
+    gateway = ShipmentGateway()
+    trace = FakeTrace()
+    case = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["order-123"],
+        "customer_request": {"claims": []},
+        "policy_version": "EC_POLICY_V2",
+        "investigation_scope": {},
+    }
+    context = create_case_context(case, gateway, trace)
+
+    result = asyncio.run(run_shipment_agent(context, ["order-123"]))
+
+    assert result["shipment_analysis"] == {
+        "verdict": "seller_delay",
+        "late_seller_ids": ["seller-1"],
+        "timeline_complete": True,
+    }
+    assert gateway.calls == [
+        ("get_shipment_summary", "CASE_001", {"order_id": "order-123"})
     ]

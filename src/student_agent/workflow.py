@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from .mcp_gateway import EvidenceGateway
@@ -111,6 +112,32 @@ def _find_numbers(value: Any, keys: set[str]) -> list[float]:
 def _sum_numbers(value: Any, keys: set[str]) -> float | None:
     numbers = _find_numbers(value, keys)
     return sum(numbers) if numbers else None
+
+
+def _find_strings(value: Any, keys: set[str]) -> list[str]:
+    found: list[str] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if key in keys and isinstance(child, str):
+                    found.append(child)
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return found
+
+
+def _first_datetime(value: Any, keys: set[str]) -> datetime | None:
+    for text in _find_strings(value, keys):
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+    return None
 
 
 def create_case_context(
@@ -326,6 +353,96 @@ async def run_payment_agent(
         actor="payment-agent",
         target="policy-agent",
         decision_code="payment_investigation_completed",
+        evidence_refs=result["evidence_refs"][:20],
+    )
+    return result
+
+
+async def run_shipment_agent(
+    context: CaseContext, order_ids: list[str] | tuple[str, ...]
+) -> dict[str, Any]:
+    evidence_refs: list[str] = []
+    verdicts: list[str] = []
+    late_seller_ids: list[str] = []
+    timeline_complete = bool(order_ids)
+
+    for order_id in order_ids:
+        evidence = await context.collector.collect(
+            actor="shipment-agent",
+            tool_name="get_shipment_summary",
+            order_id=order_id,
+        )
+        evidence_refs.append(evidence["evidence_ref"])
+        data = evidence.get("data")
+        statuses = {
+            text.lower()
+            for text in _find_strings(data, {"shipment_status", "delivery_status", "order_status"})
+        }
+        if "lost" in statuses:
+            verdicts.append("lost")
+            continue
+        if "returned" in statuses:
+            verdicts.append("returned")
+            continue
+
+        estimated = _first_datetime(
+            data,
+            {"estimated_delivery_at", "estimated_delivery_date", "order_estimated_delivery_date"},
+        )
+        delivered = _first_datetime(
+            data,
+            {"delivered_at", "delivered_date", "order_delivered_customer_date"},
+        )
+        seller_deadline = _first_datetime(
+            data,
+            {"seller_handoff_deadline", "shipping_limit_date", "seller_shipping_deadline"},
+        )
+        seller_handoff = _first_datetime(
+            data,
+            {"seller_handoff_at", "shipped_at", "order_delivered_carrier_date"},
+        )
+
+        if estimated is None or delivered is None:
+            timeline_complete = False
+            verdicts.append("insufficient_evidence")
+            continue
+
+        if delivered <= estimated:
+            verdicts.append("on_time")
+            continue
+
+        if seller_deadline is not None and seller_handoff is not None:
+            if seller_handoff > seller_deadline:
+                verdicts.append("seller_delay")
+                late_seller_ids.extend(_collect_identifiers(data, {"seller_id"}))
+            else:
+                verdicts.append("logistics_delay")
+        else:
+            timeline_complete = False
+            verdicts.append("conflicting")
+
+    unique_verdicts = set(verdicts)
+    if not verdicts or unique_verdicts == {"insufficient_evidence"}:
+        verdict = "insufficient_evidence"
+    elif len(unique_verdicts) > 1:
+        verdict = "conflicting"
+    else:
+        verdict = verdicts[0]
+
+    result = {
+        "shipment_analysis": {
+            "verdict": verdict,
+            "late_seller_ids": sorted(set(late_seller_ids)),
+            "timeline_complete": timeline_complete,
+        },
+        "evidence_refs": list(dict.fromkeys(evidence_refs)),
+    }
+    context.collector.trace.emit(
+        case_id=context.case_id,
+        event_type="handoff",
+        actor="shipment-agent",
+        target="policy-agent",
+        decision_code="shipment_investigation_completed",
         evidence_refs=result["evidence_refs"][:20],
     )
     return result
