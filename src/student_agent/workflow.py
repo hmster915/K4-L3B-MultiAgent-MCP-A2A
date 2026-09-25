@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -446,6 +447,16 @@ async def run_shipment_agent(
         evidence_refs=result["evidence_refs"][:20],
     )
     return result
+
+
+async def run_specialists(
+    context: CaseContext,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    return await asyncio.gather(
+        run_order_item_agent(context),
+        run_payment_agent(context, context.candidate_order_ids),
+        run_shipment_agent(context, context.candidate_order_ids),
+    )
 
 
 async def solve_case(

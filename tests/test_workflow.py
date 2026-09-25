@@ -9,6 +9,7 @@ from student_agent.workflow import (
     run_order_item_agent,
     run_payment_agent,
     run_shipment_agent,
+    run_specialists,
 )
 
 
@@ -108,6 +109,22 @@ class ShipmentGateway:
                 "order_delivered_customer_date": "2018-01-10T09:00:00-03:00",
             },
         }
+
+
+class ParallelGateway(FakeGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_calls = 0
+        self.max_active_calls = 0
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        self.active_calls += 1
+        self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            await asyncio.sleep(0)
+            return await super().call(tool_name, case_id=case_id, **arguments)
+        finally:
+            self.active_calls -= 1
 
 
 def test_evidence_collector_caches_case_scoped_request_and_traces_each_consumer() -> None:
@@ -259,3 +276,24 @@ def test_shipment_agent_identifies_seller_delay_from_timeline() -> None:
     assert gateway.calls == [
         ("get_shipment_summary", "CASE_001", {"order_id": "order-123"})
     ]
+
+
+def test_specialists_run_concurrently_and_return_three_results() -> None:
+    gateway = ParallelGateway()
+    trace = FakeTrace()
+    case = {
+        "case_id": "CASE_001",
+        "candidate_order_ids": ["order-123"],
+        "customer_request": {"claims": []},
+        "policy_version": "EC_POLICY_V2",
+        "investigation_scope": {},
+    }
+    context = create_case_context(case, gateway, trace)
+
+    results = asyncio.run(run_specialists(context))
+
+    assert len(results) == 3
+    assert {"entity_resolution", "payment_analysis", "shipment_analysis"} == {
+        next(iter(result)) for result in results
+    }
+    assert gateway.max_active_calls >= 2
